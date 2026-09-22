@@ -1,0 +1,51 @@
+name: Windows RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp:
+    runs-on: windows-2025
+
+    timeout-minutes: 360
+
+    steps:
+      - name: Install Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Restart-Service TermService -Force
+
+      - name: Configure RDP user
+        shell: powershell
+        run: |
+          $password = ConvertTo-SecureString "${{ secrets.RDP_PASSWORD }}" -AsPlainText -Force
+          Set-LocalUser -Name "runneradmin" -Password $password
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin"
+
+      - name: Get Tailscale IP
+        shell: powershell
+        run: |
+          tailscale ip -4
+
+      - name: Test Tailscale
+        shell: powershell
+        run: |
+          tailscale status
+          tailscale netcheck
+
+      - name: Keep RDP alive
+        shell: powershell
+        run: |
+          Write-Host "RDP activo."
+          Write-Host "Usuario: runneradmin"
+          Write-Host "Puerto: 3389"
+          while ($true) {
+            Start-Sleep -Seconds 60
+          }
