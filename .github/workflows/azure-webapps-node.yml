@@ -6,46 +6,125 @@ on:
 jobs:
   rdp:
     runs-on: windows-2025
-
     timeout-minutes: 360
 
     steps:
-      - name: Install Tailscale
+      - name: Connect Tailscale
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          version: latest
+          log-mode: normal
+          retry: 5
 
-      - name: Enable RDP
+      - name: Configure RDP
         shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Restart-Service TermService -Force
 
-      - name: Configure RDP user
+          $user = Get-LocalUser -Name "runneradmin" -ErrorAction Stop
+
+          $password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          Set-LocalUser `
+            -Name "runneradmin" `
+            -Password $password
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "runneradmin" `
+            -ErrorAction SilentlyContinue
+
+          Set-Service `
+            -Name "TermService" `
+            -StartupType Automatic
+
+          Restart-Service `
+            -Name "TermService" `
+            -Force
+
+          Start-Sleep -Seconds 5
+
+      - name: Verify RDP
         shell: powershell
         run: |
-          $password = ConvertTo-SecureString "${{ secrets.RDP_PASSWORD }}" -AsPlainText -Force
-          Set-LocalUser -Name "runneradmin" -Password $password
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin"
+          Write-Host "=== RDP SERVICE ==="
+          Get-Service TermService | Format-Table Name, Status, StartType
 
-      - name: Get Tailscale IP
+          Write-Host "=== RDP PORT ==="
+          Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction Stop
+
+          Write-Host "=== RDP FIREWALL ==="
+          Get-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            | Where-Object Enabled -eq "True" `
+            | Format-Table DisplayName, Enabled, Profile
+
+      - name: Show Tailscale information
         shell: powershell
         run: |
+          Write-Host "=== TAILSCALE VERSION ==="
+          tailscale version
+
+          Write-Host "=== TAILSCALE IP ==="
           tailscale ip -4
 
-      - name: Test Tailscale
-        shell: powershell
-        run: |
+          Write-Host "=== TAILSCALE STATUS ==="
           tailscale status
-          tailscale netcheck
 
-      - name: Keep RDP alive
+      - name: Test RDP locally
         shell: powershell
         run: |
-          Write-Host "RDP activo."
+          $test = Test-NetConnection `
+            -ComputerName "127.0.0.1" `
+            -Port 3389
+
+          if (-not $test.TcpTestSucceeded) {
+            Write-Error "RDP no está escuchando en 3389."
+            exit 1
+          }
+
+          Write-Host "RDP está escuchando correctamente en TCP 3389."
+
+      - name: Keep runner alive
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "       WINDOWS RDP DISPONIBLE"
+          Write-Host "========================================"
+          Write-Host ""
+
+          $ip = tailscale ip -4
+
+          Write-Host "IP Tailscale: $ip"
           Write-Host "Usuario: runneradmin"
           Write-Host "Puerto: 3389"
+          Write-Host ""
+
+          Write-Host "El runner permanecerá activo hasta"
+          Write-Host "que GitHub alcance el límite de 360 minutos."
+          Write-Host ""
+
           while ($true) {
+            Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - RDP activo"
             Start-Sleep -Seconds 60
           }
