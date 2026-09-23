@@ -1,0 +1,124 @@
+name: Ubuntu SSH Server
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          version: latest
+          log-mode: normal
+          retry: 5
+
+      - name: Configure SSH
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+
+          sudo mkdir -p /run/sshd
+
+          echo "runner:$SSH_PASSWORD" | sudo chpasswd
+
+          sudo sed -i \
+            's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' \
+            /etc/ssh/sshd_config
+
+          sudo sed -i \
+            's/^#\?PermitRootLogin .*/PermitRootLogin no/' \
+            /etc/ssh/sshd_config
+
+          sudo sed -i \
+            's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' \
+            /etc/ssh/sshd_config
+
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
+
+      - name: Verify SSH
+        run: |
+          echo "=== SSH SERVICE ==="
+          sudo systemctl status ssh --no-pager
+
+          echo ""
+          echo "=== SSH PORT ==="
+          sudo ss -lntp | grep ':22'
+
+          echo ""
+          echo "=== SSH CONFIG ==="
+          sudo sshd -T | grep -E \
+            'passwordauthentication|pubkeyauthentication|permitrootlogin'
+
+      - name: Show Tailscale information
+        run: |
+          echo "=== TAILSCALE VERSION ==="
+          tailscale version
+
+          echo ""
+          echo "=== TAILSCALE IP ==="
+          tailscale ip -4
+
+          echo ""
+          echo "=== TAILSCALE STATUS ==="
+          tailscale status
+
+      - name: Test SSH locally
+        run: |
+          if ! timeout 5 bash -c '</dev/tcp/127.0.0.1/22'; then
+            echo "SSH no está escuchando en el puerto 22."
+            exit 1
+          fi
+
+          echo "SSH está escuchando correctamente en TCP 22."
+
+      - name: System information
+        run: |
+          echo "=== OS ==="
+          cat /etc/os-release
+
+          echo ""
+          echo "=== CPU ==="
+          nproc
+          lscpu | grep "Model name" | head -1
+
+          echo ""
+          echo "=== RAM ==="
+          free -h
+
+          echo ""
+          echo "=== DISK ==="
+          df -h /
+
+      - name: Keep runner alive
+        run: |
+          echo ""
+          echo "========================================"
+          echo "        UBUNTU SSH DISPONIBLE"
+          echo "========================================"
+          echo ""
+
+          IP=$(tailscale ip -4)
+
+          echo "IP Tailscale: $IP"
+          echo "Usuario: runner"
+          echo "Puerto: 22"
+          echo ""
+          echo "Conexión:"
+          echo "ssh runner@$IP"
+          echo ""
+          echo "El runner permanecerá activo hasta"
+          echo "que GitHub finalice el job."
+          echo ""
+
+          while true; do
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - SSH activo - $IP"
+            sleep 60
+          done
