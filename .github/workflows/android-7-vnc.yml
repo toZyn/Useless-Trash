@@ -1,11 +1,22 @@
-name: Android 7 VNC
+name: Android 7.1 VNC
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: android-7-vnc
   cancel-in-progress: true
+
+env:
+  ANDROID_ISO: /tmp/android-x86-7.1-r5.iso
+  ANDROID_ISO_URL: https://sourceforge.net/projects/android-x86/files/Release%207.1/android-x86_64-7.1-r5.iso/download
+  ANDROID_ISO_SHA1: 1e65cb2e37b415576939398baf4c8a92330fbb24
+  QEMU_LOG: /tmp/android-qemu.log
+  QEMU_PID: /tmp/android-qemu.pid
+  QEMU_MONITOR: /tmp/android-monitor.sock
 
 jobs:
   android:
@@ -13,119 +24,189 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Connect Tailscale
+      - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           version: latest
-          log-mode: normal
+          log-mode: quiet
           retry: 5
 
-      - name: Enable KVM
+      - name: Prepare KVM and QEMU
+        shell: bash
         run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm || true
-          ls -l /dev/kvm || true
+          set -Eeuo pipefail
 
-      - name: Install virtualization tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils socat curl
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-system-gui \
+            socat
 
-      - name: Download Android 7.1
+          if [[ ! -e /dev/kvm ]]; then
+            echo "::error::/dev/kvm no existe en este runner."
+            exit 1
+          fi
+
+          sudo chmod 666 /dev/kvm
+
+          if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+            echo "::error::El runner expone /dev/kvm, pero no permite usarlo."
+            ls -l /dev/kvm || true
+            exit 1
+          fi
+
+          echo "KVM activo: aceleración por hardware habilitada."
+          qemu-system-x86_64 --version | head -1
+
+      - name: Restore Android-x86 ISO cache
+        id: android-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.ANDROID_ISO }}
+          key: android-x86-7.1-r5-x86_64-${{ env.ANDROID_ISO_SHA1 }}
+
+      - name: Download Android-x86 7.1-r5
+        if: steps.android-cache.outputs.cache-hit != 'true'
+        shell: bash
         run: |
           set -Eeuo pipefail
           curl -fL \
-            --retry 4 \
+            --retry 5 \
+            --retry-delay 2 \
             --retry-all-errors \
-            --connect-timeout 20 \
+            --connect-timeout 15 \
             --max-time 1200 \
-            -o android-7.iso \
-            "https://sourceforge.net/projects/android-x86/files/Release%207.1/android-x86_64-7.1-r5.iso/download"
-          test -s android-7.iso
-          echo "1e65cb2e37b415576939398baf4c8a92330fbb24  android-7.iso" | sha1sum -c -
+            -o "$ANDROID_ISO" \
+            "$ANDROID_ISO_URL"
 
-      - name: Start Android 7.1 optimized
+      - name: Verify Android-x86 ISO
+        shell: bash
         run: |
           set -Eeuo pipefail
-          TS_IP="$(tailscale ip -4 | head -1)"
-          test -n "$TS_IP"
-          echo "$TS_IP" > /tmp/tailscale-ip
+          test -s "$ANDROID_ISO"
+          printf '%s  %s\n' "$ANDROID_ISO_SHA1" "$ANDROID_ISO" | sha1sum -c -
+
+      - name: Save Android-x86 ISO cache
+        if: steps.android-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.ANDROID_ISO }}
+          key: android-x86-7.1-r5-x86_64-${{ env.ANDROID_ISO_SHA1 }}
+
+      - name: Start Android-x86
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          fail() {
+            code=$?
+            echo "::error::QEMU no pudo iniciar correctamente."
+            if [[ -f "$QEMU_LOG" ]]; then
+              echo "----- QEMU LOG -----"
+              cat "$QEMU_LOG"
+              echo "--------------------"
+            fi
+            exit "$code"
+          }
+          trap fail ERR
+
+          TS_IP="$(tailscale ip -4 | head -n1)"
+          [[ -n "$TS_IP" ]]
+          printf '%s\n' "$TS_IP" > /tmp/tailscale-ip
 
           HOST_CPUS="$(nproc)"
-          if [ "$HOST_CPUS" -gt 4 ]; then VCPUS=4; else VCPUS="$HOST_CPUS"; fi
-          if [ "$VCPUS" -lt 2 ]; then VCPUS=1; fi
-
-          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-            ACCEL=(-accel kvm -cpu host)
-            echo "KVM activo: aceleración por hardware habilitada."
-          else
-            ACCEL=(-accel tcg,thread=multi,tb-size=1024 -cpu max)
+          if (( HOST_CPUS >= 4 )); then
+            VCPUS=4
+          elif (( HOST_CPUS >= 2 )); then
             VCPUS=2
-            echo "ADVERTENCIA: KVM no está disponible. Android funcionará, pero TCG será notablemente más lento."
+          else
+            VCPUS=1
           fi
 
-          qemu-img create -f raw /tmp/android-7-data.img 8G
+          rm -f "$QEMU_MONITOR" "$QEMU_PID" "$QEMU_LOG"
 
           qemu-system-x86_64 \
-            "${ACCEL[@]}" \
-            -machine pc \
+            -name android-7.1-r5 \
+            -machine pc,accel=kvm \
+            -cpu host \
             -smp "$VCPUS",sockets=1,cores="$VCPUS",threads=1 \
             -m 3072 \
-            -cdrom android-7.iso \
-            -drive file=/tmp/android-7-data.img,if=virtio,format=raw,cache=writeback,aio=threads,discard=unmap \
             -boot order=d,menu=off \
-            -vga qxl \
-            -usb \
-            -device usb-tablet \
-            -nic user,model=virtio-net-pci \
+            -cdrom "$ANDROID_ISO" \
+            -vga std \
+            -device usb-ehci,id=ehci \
+            -device usb-tablet,bus=ehci.0 \
+            -netdev user,id=net0,ipv6=off \
+            -device virtio-net-pci,netdev=net0 \
             -display none \
             -vnc "$TS_IP:0,lossy=on,share=ignore,key-delay-ms=5" \
-            -monitor unix:/tmp/android-monitor.sock,server=on,wait=off \
-            -pidfile /tmp/android.pid \
-            -D /tmp/android-qemu.log \
+            -monitor "unix:$QEMU_MONITOR,server=on,wait=off" \
+            -pidfile "$QEMU_PID" \
+            -D "$QEMU_LOG" \
             -daemonize
 
-          for i in {1..30}; do
-            [ -S /tmp/android-monitor.sock ] && break
+          for _ in {1..30}; do
+            if [[ -s "$QEMU_PID" ]] && kill -0 "$(cat "$QEMU_PID")" 2>/dev/null && [[ -S "$QEMU_MONITOR" ]]; then
+              break
+            fi
             sleep 1
           done
-          test -S /tmp/android-monitor.sock
 
-          sleep 3
-          printf 'sendkey ret\n' | socat - UNIX-CONNECT:/tmp/android-monitor.sock
+          [[ -s "$QEMU_PID" ]]
+          PID="$(cat "$QEMU_PID")"
+          kill -0 "$PID"
+          [[ -S "$QEMU_MONITOR" ]]
 
-          sleep 8
-          kill -0 "$(cat /tmp/android.pid)"
-          sudo ss -lntp | grep ':5900'
+          for _ in {1..20}; do
+            if ss -lnt | grep -Fq "$TS_IP:5900"; then
+              break
+            fi
+            kill -0 "$PID"
+            sleep 1
+          done
 
-      - name: Show connection information
+          ss -lnt | grep -F "$TS_IP:5900"
+
+          sleep 2
+          printf 'sendkey ret\n' | socat - "UNIX-CONNECT:$QEMU_MONITOR"
+
+          sleep 5
+          kill -0 "$PID"
+
+          echo "Android-x86 iniciado con $VCPUS vCPU y 3072 MiB de RAM."
+          echo "VNC disponible en $TS_IP:5900"
+
+      - name: Connection information
+        shell: bash
         run: |
+          set -Eeuo pipefail
           TS_IP="$(cat /tmp/tailscale-ip)"
-          echo ""
+
           echo "========================================"
-          echo "          ANDROID 7.1 VNC"
+          echo "          ANDROID-X86 7.1-r5"
           echo "========================================"
-          echo "Android: Android-x86 7.1-r5"
-          echo "VNC: $TS_IP:5900"
-          echo "Graphics: QXL"
-          echo "VNC compression: adaptive + lossy"
-          echo ""
-          echo "Conecta tu cliente VNC a:"
-          echo "$TS_IP:5900"
-          echo ""
+          echo "VNC:      $TS_IP:5900"
+          echo "CPU:      KVM / host"
+          echo "Graphics: Standard VGA"
+          echo "Transport: Tailscale"
+          echo "========================================"
+
           tailscale status
           tailscale netcheck || true
 
-      - name: Keep Android alive
+      - name: Keep session alive
+        shell: bash
         run: |
+          set -Eeuo pipefail
           TS_IP="$(cat /tmp/tailscale-ip)"
-          PID="$(cat /tmp/android.pid)"
+          PID="$(cat "$QEMU_PID")"
+
           while kill -0 "$PID" 2>/dev/null; do
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - Android 7.1 activo - VNC $TS_IP:5900"
+            echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Android activo | VNC $TS_IP:5900"
             sleep 60
           done
-          echo "Android se detuvo."
-          cat /tmp/android-qemu.log || true
+
+          echo "::error::El proceso de Android/QEMU terminó inesperadamente."
+          cat "$QEMU_LOG" || true
           exit 1
