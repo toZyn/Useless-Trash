@@ -1,0 +1,113 @@
+name: Android 7 VNC
+
+on:
+  workflow_dispatch:
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          version: latest
+          log-mode: normal
+          retry: 5
+
+      - name: Install virtualization tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils socat curl
+
+      - name: Download Android 7.1
+        run: |
+          curl -fL \
+            --retry 3 \
+            --connect-timeout 20 \
+            -o android-7.iso \
+            "https://sourceforge.net/projects/android-x86/files/Release%207.1/android-x86_64-7.1-r5.iso/download"
+
+          test -s android-7.iso
+          echo "1e65cb2e37b415576939398baf4c8a92330fbb24  android-7.iso" | sha1sum -c -
+
+      - name: Start Android 7.1
+        run: |
+          set -e
+
+          TS_IP="$(tailscale ip -4 | head -1)"
+          echo "$TS_IP" > /tmp/tailscale-ip
+
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            ACCEL="-enable-kvm -cpu host"
+            echo "KVM disponible."
+          else
+            ACCEL="-accel tcg,thread=multi -cpu max"
+            echo "KVM no disponible. Usando TCG."
+          fi
+
+          qemu-img create -f qcow2 android-7-data.qcow2 8G
+
+          qemu-system-x86_64 \
+            $ACCEL \
+            -machine pc \
+            -smp 2 \
+            -m 3072 \
+            -cdrom android-7.iso \
+            -drive file=android-7-data.qcow2,if=ide,format=qcow2 \
+            -boot order=d \
+            -vga std \
+            -usb \
+            -device usb-tablet \
+            -nic user,model=e1000 \
+            -display none \
+            -vnc "$TS_IP:0" \
+            -monitor unix:/tmp/android-monitor.sock,server,nowait \
+            -pidfile /tmp/android.pid \
+            -D /tmp/android-qemu.log \
+            -daemonize
+
+          for i in {1..30}; do
+            [ -S /tmp/android-monitor.sock ] && break
+            sleep 1
+          done
+
+          sleep 5
+          printf 'sendkey ret\n' | socat - UNIX-CONNECT:/tmp/android-monitor.sock || true
+
+      - name: Show connection information
+        run: |
+          TS_IP="$(cat /tmp/tailscale-ip)"
+
+          echo ""
+          echo "========================================"
+          echo "          ANDROID 7.1 VNC"
+          echo "========================================"
+          echo ""
+          echo "Android: Android-x86 7.1-r5"
+          echo "VNC: $TS_IP:5900"
+          echo ""
+          echo "Conecta tu cliente VNC a:"
+          echo "$TS_IP:5900"
+          echo ""
+          echo "La interfaz mostrada por VNC es Android."
+          echo ""
+
+          tailscale status
+          sudo ss -lntp | grep ':5900' || true
+
+      - name: Keep Android alive
+        run: |
+          TS_IP="$(cat /tmp/tailscale-ip)"
+
+          while kill -0 "$(cat /tmp/android.pid)" 2>/dev/null; do
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Android 7.1 activo - VNC $TS_IP:5900"
+            sleep 60
+          done
+
+          echo "Android se detuvo."
+          cat /tmp/android-qemu.log || true
+          exit 1

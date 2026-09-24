@@ -1,0 +1,120 @@
+name: Android 3 VNC
+
+on:
+  workflow_dispatch:
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          version: latest
+          log-mode: normal
+          retry: 5
+
+      - name: Install virtualization tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils socat curl
+
+      - name: Download Android 3.2 Honeycomb
+        run: |
+          set -e
+          URLS=(
+            "https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/android-x86/android-x86-3.2-RC2-eeepc.iso"
+            "https://downloads.sourceforge.net/project/android-x86/Release%203.2/android-x86-3.2-RC2-eeepc.iso"
+          )
+
+          for URL in "${URLS[@]}"; do
+            echo "Intentando: $URL"
+            if curl -fL --retry 3 --connect-timeout 20 -o android-3.iso "$URL"; then
+              break
+            fi
+          done
+
+          test -s android-3.iso
+          file android-3.iso
+
+      - name: Start Android 3.2
+        run: |
+          set -e
+
+          TS_IP="$(tailscale ip -4 | head -1)"
+          echo "$TS_IP" > /tmp/tailscale-ip
+
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            ACCEL="-enable-kvm -cpu host"
+            echo "KVM disponible."
+          else
+            ACCEL="-accel tcg,thread=multi -cpu max"
+            echo "KVM no disponible. Usando TCG."
+          fi
+
+          qemu-img create -f qcow2 android-3-data.qcow2 4G
+
+          qemu-system-i386 \
+            $ACCEL \
+            -machine pc \
+            -smp 2 \
+            -m 1024 \
+            -cdrom android-3.iso \
+            -drive file=android-3-data.qcow2,if=ide,format=qcow2 \
+            -boot order=d \
+            -vga std \
+            -usb \
+            -device usb-tablet \
+            -nic user,model=rtl8139 \
+            -display none \
+            -vnc "$TS_IP:0" \
+            -monitor unix:/tmp/android-monitor.sock,server,nowait \
+            -pidfile /tmp/android.pid \
+            -D /tmp/android-qemu.log \
+            -daemonize
+
+          for i in {1..30}; do
+            [ -S /tmp/android-monitor.sock ] && break
+            sleep 1
+          done
+
+          sleep 5
+          printf 'sendkey ret\n' | socat - UNIX-CONNECT:/tmp/android-monitor.sock || true
+
+      - name: Show connection information
+        run: |
+          TS_IP="$(cat /tmp/tailscale-ip)"
+
+          echo ""
+          echo "========================================"
+          echo "       ANDROID 3.2 HONEYCOMB VNC"
+          echo "========================================"
+          echo ""
+          echo "Android: Android-x86 3.2 RC2"
+          echo "VNC: $TS_IP:5900"
+          echo ""
+          echo "Conecta tu cliente VNC a:"
+          echo "$TS_IP:5900"
+          echo ""
+          echo "La interfaz mostrada por VNC es Android."
+          echo ""
+
+          tailscale status
+          sudo ss -lntp | grep ':5900' || true
+
+      - name: Keep Android alive
+        run: |
+          TS_IP="$(cat /tmp/tailscale-ip)"
+
+          while kill -0 "$(cat /tmp/android.pid)" 2>/dev/null; do
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Android 3.2 activo - VNC $TS_IP:5900"
+            sleep 60
+          done
+
+          echo "Android se detuvo."
+          cat /tmp/android-qemu.log || true
+          exit 1
