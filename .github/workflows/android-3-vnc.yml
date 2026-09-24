@@ -3,6 +3,10 @@ name: Android 3 VNC
 on:
   workflow_dispatch:
 
+concurrency:
+  group: android-3-vnc
+  cancel-in-progress: true
+
 jobs:
   android:
     runs-on: ubuntu-24.04
@@ -17,62 +21,68 @@ jobs:
           log-mode: normal
           retry: 5
 
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || true
+
       - name: Install virtualization tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 qemu-utils socat curl
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils socat curl
 
       - name: Download Android 3.2 Honeycomb
         run: |
-          set -e
+          set -Eeuo pipefail
           URLS=(
             "https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/android-x86/android-x86-3.2-RC2-eeepc.iso"
             "https://downloads.sourceforge.net/project/android-x86/Release%203.2/android-x86-3.2-RC2-eeepc.iso"
           )
-
+          rm -f android-3.iso
           for URL in "${URLS[@]}"; do
             echo "Intentando: $URL"
-            if curl -fL --retry 3 --connect-timeout 20 -o android-3.iso "$URL"; then
+            if curl -fL --retry 4 --retry-all-errors --connect-timeout 20 --max-time 600 -o android-3.iso "$URL"; then
               break
             fi
+            rm -f android-3.iso
           done
-
           test -s android-3.iso
           file android-3.iso
 
-      - name: Start Android 3.2
+      - name: Start Android 3.2 in VESA mode
         run: |
-          set -e
-
+          set -Eeuo pipefail
           TS_IP="$(tailscale ip -4 | head -1)"
+          test -n "$TS_IP"
           echo "$TS_IP" > /tmp/tailscale-ip
 
-          if [ -e /dev/kvm ]; then
-            sudo chmod 666 /dev/kvm
-            ACCEL="-enable-kvm -cpu host"
-            echo "KVM disponible."
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            ACCEL=(-accel kvm -cpu host)
+            echo "KVM activo."
           else
-            ACCEL="-accel tcg,thread=multi -cpu max"
-            echo "KVM no disponible. Usando TCG."
+            ACCEL=(-accel tcg,thread=multi,tb-size=512 -cpu max)
+            echo "ADVERTENCIA: KVM no disponible; se usará TCG."
           fi
 
-          qemu-img create -f qcow2 android-3-data.qcow2 4G
+          qemu-img create -f raw /tmp/android-3-data.img 4G
 
           qemu-system-i386 \
-            $ACCEL \
+            "${ACCEL[@]}" \
             -machine pc \
-            -smp 2 \
+            -smp 2,sockets=1,cores=2,threads=1 \
             -m 1024 \
             -cdrom android-3.iso \
-            -drive file=android-3-data.qcow2,if=ide,format=qcow2 \
-            -boot order=d \
+            -drive file=/tmp/android-3-data.img,if=ide,format=raw,cache=writeback,aio=threads \
+            -boot order=d,menu=off \
             -vga std \
             -usb \
             -device usb-tablet \
             -nic user,model=rtl8139 \
             -display none \
-            -vnc "$TS_IP:0" \
-            -monitor unix:/tmp/android-monitor.sock,server,nowait \
+            -vnc "$TS_IP:0,lossy=on,share=ignore,key-delay-ms=5" \
+            -monitor unix:/tmp/android-monitor.sock,server=on,wait=off \
             -pidfile /tmp/android.pid \
             -D /tmp/android-qemu.log \
             -daemonize
@@ -81,40 +91,44 @@ jobs:
             [ -S /tmp/android-monitor.sock ] && break
             sleep 1
           done
+          test -S /tmp/android-monitor.sock
 
-          sleep 5
-          printf 'sendkey ret\n' | socat - UNIX-CONNECT:/tmp/android-monitor.sock || true
+          sleep 3
+          {
+            printf 'sendkey down\n'
+            sleep 1
+            printf 'sendkey ret\n'
+          } | socat - UNIX-CONNECT:/tmp/android-monitor.sock
+
+          sleep 8
+          kill -0 "$(cat /tmp/android.pid)"
+          sudo ss -lntp | grep ':5900'
 
       - name: Show connection information
         run: |
           TS_IP="$(cat /tmp/tailscale-ip)"
-
           echo ""
           echo "========================================"
           echo "       ANDROID 3.2 HONEYCOMB VNC"
           echo "========================================"
-          echo ""
           echo "Android: Android-x86 3.2 RC2"
+          echo "Graphics: VESA compatibility mode"
           echo "VNC: $TS_IP:5900"
           echo ""
           echo "Conecta tu cliente VNC a:"
           echo "$TS_IP:5900"
           echo ""
-          echo "La interfaz mostrada por VNC es Android."
-          echo ""
-
           tailscale status
-          sudo ss -lntp | grep ':5900' || true
+          tailscale netcheck || true
 
       - name: Keep Android alive
         run: |
           TS_IP="$(cat /tmp/tailscale-ip)"
-
-          while kill -0 "$(cat /tmp/android.pid)" 2>/dev/null; do
+          PID="$(cat /tmp/android.pid)"
+          while kill -0 "$PID" 2>/dev/null; do
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Android 3.2 activo - VNC $TS_IP:5900"
             sleep 60
           done
-
           echo "Android se detuvo."
           cat /tmp/android-qemu.log || true
           exit 1

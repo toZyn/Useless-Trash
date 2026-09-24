@@ -3,6 +3,10 @@ name: Android 7 VNC
 on:
   workflow_dispatch:
 
+concurrency:
+  group: android-7-vnc
+  cancel-in-progress: true
+
 jobs:
   android:
     runs-on: ubuntu-24.04
@@ -17,55 +21,68 @@ jobs:
           log-mode: normal
           retry: 5
 
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || true
+
       - name: Install virtualization tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 qemu-utils socat curl
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils socat curl
 
       - name: Download Android 7.1
         run: |
+          set -Eeuo pipefail
           curl -fL \
-            --retry 3 \
+            --retry 4 \
+            --retry-all-errors \
             --connect-timeout 20 \
+            --max-time 1200 \
             -o android-7.iso \
             "https://sourceforge.net/projects/android-x86/files/Release%207.1/android-x86_64-7.1-r5.iso/download"
-
           test -s android-7.iso
           echo "1e65cb2e37b415576939398baf4c8a92330fbb24  android-7.iso" | sha1sum -c -
 
-      - name: Start Android 7.1
+      - name: Start Android 7.1 optimized
         run: |
-          set -e
-
+          set -Eeuo pipefail
           TS_IP="$(tailscale ip -4 | head -1)"
+          test -n "$TS_IP"
           echo "$TS_IP" > /tmp/tailscale-ip
 
-          if [ -e /dev/kvm ]; then
-            sudo chmod 666 /dev/kvm
-            ACCEL="-enable-kvm -cpu host"
-            echo "KVM disponible."
+          HOST_CPUS="$(nproc)"
+          if [ "$HOST_CPUS" -gt 4 ]; then VCPUS=4; else VCPUS="$HOST_CPUS"; fi
+          if [ "$VCPUS" -lt 2 ]; then VCPUS=1; fi
+
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            ACCEL=(-accel kvm -cpu host)
+            echo "KVM activo: aceleración por hardware habilitada."
           else
-            ACCEL="-accel tcg,thread=multi -cpu max"
-            echo "KVM no disponible. Usando TCG."
+            ACCEL=(-accel tcg,thread=multi,tb-size=1024 -cpu max)
+            VCPUS=2
+            echo "ADVERTENCIA: KVM no está disponible. Android funcionará, pero TCG será notablemente más lento."
           fi
 
-          qemu-img create -f qcow2 android-7-data.qcow2 8G
+          qemu-img create -f raw /tmp/android-7-data.img 8G
 
           qemu-system-x86_64 \
-            $ACCEL \
+            "${ACCEL[@]}" \
             -machine pc \
-            -smp 2 \
+            -smp "$VCPUS",sockets=1,cores="$VCPUS",threads=1 \
             -m 3072 \
             -cdrom android-7.iso \
-            -drive file=android-7-data.qcow2,if=ide,format=qcow2 \
-            -boot order=d \
-            -vga std \
+            -drive file=/tmp/android-7-data.img,if=virtio,format=raw,cache=writeback,aio=threads,discard=unmap \
+            -boot order=d,menu=off \
+            -vga qxl \
             -usb \
             -device usb-tablet \
-            -nic user,model=e1000 \
+            -nic user,model=virtio-net-pci \
             -display none \
-            -vnc "$TS_IP:0" \
-            -monitor unix:/tmp/android-monitor.sock,server,nowait \
+            -vnc "$TS_IP:0,lossy=on,share=ignore,key-delay-ms=5" \
+            -monitor unix:/tmp/android-monitor.sock,server=on,wait=off \
             -pidfile /tmp/android.pid \
             -D /tmp/android-qemu.log \
             -daemonize
@@ -74,40 +91,41 @@ jobs:
             [ -S /tmp/android-monitor.sock ] && break
             sleep 1
           done
+          test -S /tmp/android-monitor.sock
 
-          sleep 5
-          printf 'sendkey ret\n' | socat - UNIX-CONNECT:/tmp/android-monitor.sock || true
+          sleep 3
+          printf 'sendkey ret\n' | socat - UNIX-CONNECT:/tmp/android-monitor.sock
+
+          sleep 8
+          kill -0 "$(cat /tmp/android.pid)"
+          sudo ss -lntp | grep ':5900'
 
       - name: Show connection information
         run: |
           TS_IP="$(cat /tmp/tailscale-ip)"
-
           echo ""
           echo "========================================"
           echo "          ANDROID 7.1 VNC"
           echo "========================================"
-          echo ""
           echo "Android: Android-x86 7.1-r5"
           echo "VNC: $TS_IP:5900"
+          echo "Graphics: QXL"
+          echo "VNC compression: adaptive + lossy"
           echo ""
           echo "Conecta tu cliente VNC a:"
           echo "$TS_IP:5900"
           echo ""
-          echo "La interfaz mostrada por VNC es Android."
-          echo ""
-
           tailscale status
-          sudo ss -lntp | grep ':5900' || true
+          tailscale netcheck || true
 
       - name: Keep Android alive
         run: |
           TS_IP="$(cat /tmp/tailscale-ip)"
-
-          while kill -0 "$(cat /tmp/android.pid)" 2>/dev/null; do
+          PID="$(cat /tmp/android.pid)"
+          while kill -0 "$PID" 2>/dev/null; do
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Android 7.1 activo - VNC $TS_IP:5900"
             sleep 60
           done
-
           echo "Android se detuvo."
           cat /tmp/android-qemu.log || true
           exit 1
