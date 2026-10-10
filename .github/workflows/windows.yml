@@ -1,130 +1,131 @@
-name: Windows RDP
+name: Windows Remote Desktop
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  rdp:
+  desktop:
+    name: Windows Server 2025
     runs-on: windows-2025
     timeout-minutes: 360
 
     steps:
-      - name: Connect Tailscale
+      - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           version: latest
-          log-mode: normal
-          retry: 5
+          log-mode: quiet
 
-      - name: Configure RDP
-        shell: powershell
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" `
-            -Value 0
-
-          Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "UserAuthentication" `
-            -Value 1
-
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
-          $user = Get-LocalUser -Name "runneradmin" -ErrorAction Stop
-
-          $password = ConvertTo-SecureString `
-            $env:RDP_PASSWORD `
-            -AsPlainText `
-            -Force
-
-          Set-LocalUser `
-            -Name "runneradmin" `
-            -Password $password
-
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member "runneradmin" `
-            -ErrorAction SilentlyContinue
-
-          Set-Service `
-            -Name "TermService" `
-            -StartupType Automatic
-
-          Restart-Service `
-            -Name "TermService" `
-            -Force
-
-          Start-Sleep -Seconds 5
-
-      - name: Verify RDP
+      - name: Configure remote desktop
         shell: powershell
         run: |
-          Write-Host "=== RDP SERVICE ==="
-          Get-Service TermService | Format-Table Name, Status, StartType
+          $ErrorActionPreference = 'Stop'
 
-          Write-Host "=== RDP PORT ==="
-          Get-NetTCPConnection `
-            -LocalPort 3389 `
-            -State Listen `
-            -ErrorAction Stop
+          $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          $bytes = New-Object byte[] 24
+          try {
+            $random.GetBytes($bytes)
+          } finally {
+            $random.Dispose()
+          }
+          $password = 'Rdp!' + [Convert]::ToBase64String($bytes).TrimEnd('=')
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
 
-          Write-Host "=== RDP FIREWALL ==="
-          Get-NetFirewallRule `
-            -DisplayGroup "Remote Desktop" `
-            | Where-Object Enabled -eq "True" `
-            | Format-Table DisplayName, Enabled, Profile
+          $admin = Get-LocalUser | Where-Object { $_.SID.Value.EndsWith('-500') } | Select-Object -First 1
+          if (-not $admin) { throw 'Built-in Administrator account not found.' }
+          if ($admin.Name -ne 'Administrator') {
+            Rename-LocalUser -Name $admin.Name -NewName 'Administrator'
+          }
+          Enable-LocalUser -Name 'Administrator'
+          Set-LocalUser -Name 'Administrator' -Password $securePassword
 
-      - name: Show Tailscale information
-        shell: powershell
-        run: |
-          Write-Host "=== TAILSCALE VERSION ==="
-          tailscale version
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
 
-          Write-Host "=== TAILSCALE IP ==="
-          tailscale ip -4
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue | Disable-NetFirewallRule
+          New-NetFirewallRule -DisplayName 'RDP - Tailscale' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
 
-          Write-Host "=== TAILSCALE STATUS ==="
-          tailscale status
-
-      - name: Test RDP locally
-        shell: powershell
-        run: |
-          $test = Test-NetConnection `
-            -ComputerName "127.0.0.1" `
-            -Port 3389
-
-          if (-not $test.TcpTestSucceeded) {
-            Write-Error "RDP no está escuchando en 3389."
-            exit 1
+          Set-Service -Name 'TermService' -StartupType Automatic
+          if ((Get-Service -Name 'TermService').Status -ne 'Running') {
+            Start-Service -Name 'TermService'
           }
 
-          Write-Host "RDP está escuchando correctamente en TCP 3389."
+          $themeDir = Join-Path $env:ProgramData 'WindowsRdp'
+          New-Item -ItemType Directory -Path $themeDir -Force | Out-Null
+          $wallpaper = Join-Path $themeDir 'wallpaper.png'
 
-      - name: Keep runner alive
+          try {
+            Invoke-WebRequest -Uri 'https://files.catbox.moe/qqzc2y.png' -OutFile $wallpaper -UseBasicParsing -TimeoutSec 30
+          } catch {
+            Write-Warning 'The wallpaper could not be downloaded; dark mode will still be applied.'
+          }
+
+          $themeScript = @'
+          $ErrorActionPreference = 'Stop'
+          $personalize = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+          New-Item -Path $personalize -Force | Out-Null
+          New-ItemProperty -Path $personalize -Name 'AppsUseLightTheme' -PropertyType DWord -Value 0 -Force | Out-Null
+          New-ItemProperty -Path $personalize -Name 'SystemUsesLightTheme' -PropertyType DWord -Value 0 -Force | Out-Null
+          New-ItemProperty -Path $personalize -Name 'EnableTransparency' -PropertyType DWord -Value 0 -Force | Out-Null
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Colors' -Name 'Background' -Value '10 12 18'
+
+          $wallpaper = Join-Path $env:ProgramData 'WindowsRdp\wallpaper.png'
+          if (Test-Path -Path $wallpaper) {
+            Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'WallpaperStyle' -Value '10'
+            Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'TileWallpaper' -Value '0'
+            Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public static class DesktopTheme {
+              [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+              public static extern bool SystemParametersInfo(int action, int parameter, string value, int flags);
+          }
+          "@
+            [DesktopTheme]::SystemParametersInfo(20, 0, $wallpaper, 3) | Out-Null
+          }
+          '@
+
+          $themePath = Join-Path $themeDir 'apply-theme.ps1'
+          Set-Content -Path $themePath -Value $themeScript -Encoding UTF8
+          $startup = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+          $command = 'powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File "' + $themePath + '"'
+          New-ItemProperty -Path $startup -Name 'WindowsRdpTheme' -PropertyType String -Value $command -Force | Out-Null
+
+          $ready = $false
+          for ($i = 0; $i -lt 10; $i++) {
+            if (Test-NetConnection -ComputerName '127.0.0.1' -Port 3389 -InformationLevel Quiet -WarningAction SilentlyContinue) {
+              $ready = $true
+              break
+            }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $ready) { throw 'Remote Desktop did not start on port 3389.' }
+
+          $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
+          if (-not $ip) { throw 'No Tailscale IPv4 address is available.' }
+
+          @(
+            '## Windows Remote Desktop'
+            ''
+            '| Field | Value |'
+            '| --- | --- |'
+            "| Address | $ip`:3389 |"
+            '| Account | Administrator |'
+            "| Temporary password | $password |"
+            '| Access | Tailscale only |'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          Write-Host "Remote Desktop available at $ip`:3389"
+          Write-Host 'Sign-in credentials are in the workflow run summary.'
+
+      - name: Maintain session
         shell: powershell
         run: |
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "       WINDOWS RDP DISPONIBLE"
-          Write-Host "========================================"
-          Write-Host ""
-
-          $ip = tailscale ip -4
-
-          Write-Host "IP Tailscale: $ip"
-          Write-Host "Usuario: runneradmin"
-          Write-Host "Puerto: 3389"
-          Write-Host ""
-
-          Write-Host "El runner permanecerá activo hasta"
-          Write-Host "que GitHub alcance el límite de 360 minutos."
-          Write-Host ""
-
           while ($true) {
-            Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - RDP activo"
-            Start-Sleep -Seconds 60
+            Start-Sleep -Seconds 600
+            Write-Host "Active: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
           }
