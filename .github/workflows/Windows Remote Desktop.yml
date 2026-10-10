@@ -125,6 +125,7 @@ jobs:
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
           Write-Host "Remote Desktop available at $ip`:3389"
+          Write-Host "Temporary password: $password"
           Write-Host 'Sign-in credentials are in the workflow run summary.'
 
       - name: Maintain session
