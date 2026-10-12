@@ -1,0 +1,52 @@
+name: ZBack | Ubuntu Environment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  environment:
+    name: Ubuntu Administrator
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Initialize Ubuntu Environment
+        run: |
+          set -euo pipefail
+          echo "Operating System:"
+          cat /etc/os-release
+          echo "Administrator:"
+          sudo id
+          echo "System Resources:"
+          free -h
+          df -h /
+
+      - name: Install Node.js and npm
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          check-latest: true
+
+      - name: Verify Node.js and npm
+        run: |
+          node --version
+          npm --version
+
+      - name: Install ZBack Globally
+        run: |
+          sudo env "PATH=$PATH" npm install --global zback
+          command -v zback
+          zback --version || true
+
+      - name: Start ZBack as Administrator
+        run: |
+          sudo env "PATH=$PATH" \
+            FORCE_COLOR=1 \
+            zback
