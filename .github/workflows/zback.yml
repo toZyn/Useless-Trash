@@ -38,7 +38,9 @@ jobs:
           expect <<'EXPECT'
           log_user 1
           set timeout -1
+
           set authorized 0
+          set workspace_configured 0
 
           spawn sudo env \
             PATH=$env(PATH) \
@@ -47,13 +49,22 @@ jobs:
             zback
 
           expect {
-            -re {No, I do not accept} {
+            -re {Your choice \[y/N\]:} {
               if {!$authorized} {
                 set authorized 1
                 send -- "Y\r"
               }
               exp_continue
             }
+
+            -re {Your choice \[Y/n\]:} {
+              if {!$workspace_configured} {
+                set workspace_configured 1
+                send -- "N\r"
+              }
+              exp_continue
+            }
+
             eof {}
           }
 
